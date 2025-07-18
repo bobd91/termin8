@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
 #include <termios.h>
 #include <unistd.h>
 #include <pty.h>
@@ -23,23 +25,130 @@ int *amaster = &master_fd;
 
 pid_t pid;
 
-#define iobuf_size 1024
-unsigned char iobuf[iobuf_size];
+#define BUFFER_SIZE 1024
+#define MAX_SEQ 80
+#define MAX_ESC_BYTES 10
+
+char seq[MAX_SEQ + 1];
+char *seq_p;
+
+struct buffer {
+  char bytes[BUFFER_SIZE];
+  int count;
+  int next_start;
+  int next_end;
+} buffers[2];
 
 FILE *log_file;
 
-enum log_types {
-  LOG_IN = 0,
-  LOG_OUT = 1
+enum buffer_type {
+  IN_BUF = 0,
+  OUT_BUF = 1
 };
 
-char *log_prefix[] = { "\n<<<<<<\n", "\n>>>>>>\n" };
+char *log_prefix[] = { ">>>>>>", "<<<<<<" };
 
-void log_bytes(enum log_types log_type, int count) {
-  if(log_file) {
-    fputs(log_prefix[log_type], log_file);
-    fwrite(iobuf, 1, count, log_file);
+static int min(int i1, int i2) {
+  return i1 < i2 ? i1 : i2;
+}
+
+static void seq_init() {
+  seq_p = seq;
+  *seq_p = '\0';
+}
+
+static void seq_printf(const char * fmt, ...) {
+  va_list ap;
+  int max_len = MAX_SEQ - (seq_p - seq);
+  va_start(ap, fmt);
+  int n = vsnprintf(seq_p, max_len, fmt, ap);
+  va_end(ap);
+  if(n > max_len) n = max_len;
+  seq_p += n;
+}
+
+static void seq_bytes(unsigned char *bytes, int n) {
+  memcpy(seq_p, bytes, n);
+  seq_p += n;
+  *seq_p = '\0';
+}
+
+static int unknown(char *type, struct buffer *buf, int pos) {
+  seq_init();
+  seq_printf("Unknown %s: ", type);
+  seq_bytes(buf->bytes + pos, min(MAX_ESC_BYTES, buf->count - pos));
+  return 1;
+}
+
+static int csi_out(struct buffer *buf, int pos) {
+  return unknown("CSI", buf, pos);
+}
+
+static int osc_out(struct buffer *buf, int pos) {
+  return unknown("OSC", buf, pos);
+}
+
+static int apc_out(struct buffer *buf, int pos) {
+  return unknown("APC", buf, pos);
+}
+
+static int escape_in(struct buffer *buf, int pos) {
+  return unknown("Escape", buf, pos);
+}
+
+static int escape_out(struct buffer *buf, int pos) {
+  switch(buf->bytes[pos]) {
+    case '[':
+      return csi_out(buf, pos + 1);
+    case ']':
+      return osc_out(buf, pos + 1);
+    case '_':
+      return apc_out(buf, pos + 1);
   }
+
+  return unknown("Escape", buf, pos);
+}
+
+static int escape_sequence(enum buffer_type type, int pos) {
+  struct buffer *buf = &buffers[type];
+  if(type == IN_BUF) {
+    return escape_in(buf, pos);
+  } else {
+    return escape_out(buf, pos);
+  }
+}
+  
+
+static int next_escape_sequence(enum buffer_type type) {
+  struct buffer *buf = &buffers[type];
+  int i = buf->next_start;
+  while(buf->count > i && 0x1b != buf->bytes[i++] )
+    ;
+  if(buf->count > i) {
+    // found Esc
+    if(buf->count > ++i) {
+      return escape_sequence(type, i);
+    }
+  }
+  buf->next_end = buf->count;
+  return 0;
+}
+  
+
+static int process_next(enum buffer_type type) {
+  struct buffer *buf = &buffers[type];
+
+  buf->next_start = buf->next_end;
+
+  if(log_file) {
+    if(next_escape_sequence(type)) {
+      fprintf(log_file, "%s\n%s\n", log_prefix[type], seq);
+    }
+  } else {
+    buf->next_end = buf->count;
+  }
+
+  return buf->next_end > buf->next_start;
 } 
 
 FILE *open_log(const char *log_file) {
@@ -57,7 +166,6 @@ void flush_all() {
 }
 
 void enable_raw_mode() {
-  tcgetattr(STDIN_FILENO, termios_s);
   atexit(disable_raw_mode);
 
   struct termios raw = termios_s[0];
@@ -72,33 +180,46 @@ static void resize(int sig) {
   kill(pid, SIGWINCH);
 }
 
-static int copy_bytes(int from_fd, int to_fd) {
-  int bytes_read = read(from_fd, iobuf, iobuf_size);
+static void copy_bytes(int from_fd, int to_fd, enum buffer_type type) {
+  struct buffer *buf = &buffers[type];
+
+  int bytes_read = read(from_fd, buf->bytes + buf->count, BUFFER_SIZE - buf->count);
   if(-1 == bytes_read) {
     perror("read failure in copy_bytes");
     exit(EXIT_FAILURE);
   }
-  int bytes_written = 0;
-  while(bytes_read > bytes_written) {
-    int bytes = write(to_fd, iobuf + bytes_written, bytes_read - bytes_written);
-    if(-1 == bytes) {
-      perror("write failure in copy_bytes");
-      exit(EXIT_FAILURE);
+  buf->count += bytes_read;
+
+  buf->next_end = 0;
+  while(process_next(type)) {
+    int start = buf->next_start;
+    int count = buf->next_end - start;
+    int bytes_written = 0;
+    while(count > bytes_written) {
+      int bytes = write(to_fd, buf->bytes + start + bytes_written, count - bytes_written);
+      if(-1 == bytes) {
+        perror("write failure in copy_bytes");
+        exit(EXIT_FAILURE);
+      }
+      bytes_written += bytes;
     }
-    bytes_written += bytes;
   }
-  return bytes_read;
+
+  // Copy to start of buf->bytes anything not yet output
+  int out_count = buf->next_end;
+  buf->count = buf->count - out_count;
+  unsigned char *to = buf->bytes;
+  unsigned char *from = to + out_count;
+  for(int i = 0 ; i < buf->count ; i++, to++, from++) {
+    *to = *from;
+  }
 }
 
 static void master_process(int fd) {
-  int count;
-  if(fd == STDIN_FILENO) {
-    count = copy_bytes(fd, master_fd);
-    log_bytes(LOG_IN, count);
-  } else if(fd == master_fd) {
-    count = copy_bytes(fd, STDOUT_FILENO);
-    log_bytes(LOG_OUT, count);
-  }
+  if(fd == STDIN_FILENO)
+    copy_bytes(fd, master_fd, IN_BUF);
+  else
+    copy_bytes(fd, STDOUT_FILENO, OUT_BUF);
 }
     
 
@@ -147,17 +268,8 @@ static void slave() {
 }
 
 int main(int argc, char *argv[]) {
-  if(argc = 2) {
-    log_file = open_log(argv[1]);
-  }
-
-  atexit(flush_all);
-
-  signal(SIGWINCH, resize);
-  
+  tcgetattr(STDIN_FILENO, termios_s);
   ioctl(0, TIOCGWINSZ, wins_s);
-
-  enable_raw_mode();
 
   pid = forkpty(amaster, NULL, termios_s, wins_s);
   if(-1 == pid) {
@@ -168,5 +280,15 @@ int main(int argc, char *argv[]) {
   if(pid == 0) {
     slave();
   }
+
+  if(argc = 2) {
+    log_file = open_log(argv[1]);
+  }
+  atexit(flush_all);
+
+  signal(SIGWINCH, resize);
+  
+  enable_raw_mode();
+
   master();
 }
