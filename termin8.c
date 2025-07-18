@@ -26,8 +26,34 @@ pid_t pid;
 #define iobuf_size 1024
 unsigned char iobuf[iobuf_size];
 
+FILE *log_file;
+
+enum log_types {
+  LOG_IN = 0,
+  LOG_OUT = 1
+};
+
+char *log_prefix[] = { "\n<<<<<<\n", "\n>>>>>>\n" };
+
+void log_bytes(enum log_types log_type, int count) {
+  if(log_file) {
+    fputs(log_prefix[log_type], log_file);
+    fwrite(iobuf, 1, count, log_file);
+  }
+} 
+
+FILE *open_log(const char *log_file) {
+  return fopen(log_file, "wb");
+}
+
 void disable_raw_mode() {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, termios_s);
+}
+
+void flush_all() {
+  fflush(stdout);
+  if(log_file)
+    fflush(log_file);
 }
 
 void enable_raw_mode() {
@@ -46,20 +72,32 @@ static void resize(int sig) {
   kill(pid, SIGWINCH);
 }
 
-static void copy_bytes(int from_fd, int to_fd) {
-  int VEXOF(bytes_read, read(from_fd, iobuf, iobuf_size));
+static int copy_bytes(int from_fd, int to_fd) {
+  int bytes_read = read(from_fd, iobuf, iobuf_size);
+  if(-1 == bytes_read) {
+    perror("read failure in copy_bytes");
+    exit(EXIT_FAILURE);
+  }
   int bytes_written = 0;
   while(bytes_read > bytes_written) {
-    int VEXOF(bytes, write(to_fd, iobuf + bytes_written, bytes_read - bytes_written));
+    int bytes = write(to_fd, iobuf + bytes_written, bytes_read - bytes_written);
+    if(-1 == bytes) {
+      perror("write failure in copy_bytes");
+      exit(EXIT_FAILURE);
+    }
     bytes_written += bytes;
   }
+  return bytes_read;
 }
 
 static void master_process(int fd) {
+  int count;
   if(fd == STDIN_FILENO) {
-    copy_bytes(fd, master_fd);
+    count = copy_bytes(fd, master_fd);
+    log_bytes(LOG_IN, count);
   } else if(fd == master_fd) {
-    copy_bytes(fd, STDOUT_FILENO);
+    count = copy_bytes(fd, STDOUT_FILENO);
+    log_bytes(LOG_OUT, count);
   }
 }
     
@@ -70,11 +108,25 @@ static void master() {
   from_master.events = EPOLLIN;
   from_master.data.fd = master_fd;
 
-  int VEXOF(epi, epoll_create1(0));
-  EXOF(epoll_ctl(epi, EPOLL_CTL_ADD, STDIN_FILENO, &from_stdin));
-  EXOF(epoll_ctl(epi, EPOLL_CTL_ADD, master_fd, &from_master));
+  int epi = epoll_create1(0);
+  if(-1 == epi) {
+    perror("epoll_create1 failure in master");
+    exit(EXIT_FAILURE);
+  }
+  if(-1 == epoll_ctl(epi, EPOLL_CTL_ADD, STDIN_FILENO, &from_stdin)) {
+    perror("epoll_ctl failure on STDIN in master");
+    exit(EXIT_FAILURE);
+  }
+  if(-1 == epoll_ctl(epi, EPOLL_CTL_ADD, master_fd, &from_master)) {
+    perror("epoll_ctl failure on master_fd in master");
+    exit(EXIT_FAILURE);
+  }
   while(1) {
-    int VEXOF(res, epoll_wait(epi, epoll_events, MAX_EPOLL_EVENTS, -1));
+    int res = epoll_wait(epi, epoll_events, MAX_EPOLL_EVENTS, -1);
+    if(-1 == res) {
+      perror("epoll_wait failure in master");
+      exit(EXIT_FAILURE);
+    }
     for(int i = 0 ; i < res ; i++) {
       if(EPOLLIN & epoll_events[i].events) {
         master_process(epoll_events[i].data.fd);
@@ -88,18 +140,30 @@ static void master() {
 
 static void slave() {
   char *cmd = getenv("SHELL");
+  char *home = getenv("HOME");
   char *argv[] = { cmd, NULL };
+  chdir(home);
   execve(cmd, argv, environ); 
 }
 
 int main(int argc, char *argv[]) {
+  if(argc = 2) {
+    log_file = open_log(argv[1]);
+  }
+
+  atexit(flush_all);
+
   signal(SIGWINCH, resize);
   
   ioctl(0, TIOCGWINSZ, wins_s);
 
   enable_raw_mode();
 
-  VEXOF(pid, forkpty(amaster, NULL, termios_s, wins_s));
+  pid = forkpty(amaster, NULL, termios_s, wins_s);
+  if(-1 == pid) {
+    perror("forkpty failure in main");
+    exit(EXIT_FAILURE);
+  }
 
   if(pid == 0) {
     slave();
